@@ -50,7 +50,7 @@ def run_main(
 
     interleaved_contents = [
         # text only
-        "The color of the sky is blue but sometimes it can also be",
+        # "The color of the sky is blue but sometimes it can also be",
         # image understanding
         [
             ImageMedia(image=img),
