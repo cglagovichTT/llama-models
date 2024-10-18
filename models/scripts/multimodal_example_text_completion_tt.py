@@ -18,28 +18,45 @@ from termcolor import cprint
 
 from models.llama3.api.datatypes import ImageMedia
 
-from models.llama3.reference_impl.generation import Llama
+from models.llama3.reference_impl.generation_tt import Llama
 
 
 THIS_DIR = Path(__file__).parent.resolve()
 
+import pytest
+import os
+import ttnn
 
-def run_main(
-    ckpt_dir: str,
-    temperature: float = 0.6,
+@pytest.mark.parametrize(
+    "mesh_device",
+    [
+        {"N150": (1, 1), "N300": (1, 2), "T3K": (1, 8), "TG": (8, 4)}.get(
+            os.environ.get("FAKE_DEVICE"), len(ttnn.get_device_ids())
+        )
+    ],
+    indirect=True,
+)
+def test_run_main(
+    mesh_device,
+    # temperature: float = 0.6,
+    temperature: float = 0,
     top_p: float = 0.9,
     max_seq_len: int = 512,
     max_batch_size: int = 4,
     max_gen_len: Optional[int] = None,
     model_parallel_size: Optional[int] = None,
 ):
+    mesh_device.enable_program_cache()
+    mesh_device.enable_async(True)
     tokenizer_path = str(THIS_DIR.parent / "llama3/api/tokenizer.model")
+    ckpt_dir = os.environ["LLAMA_DIR"]
     generator = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
         model_parallel_size=model_parallel_size,
+        mesh_device=mesh_device,
     )
 
     with open(THIS_DIR / "resources/dog.jpg", "rb") as f:
@@ -51,7 +68,6 @@ def run_main(
     
     with open(THIS_DIR / "resources/ocr_image.jpeg", "rb") as f:
         ocr_image = PIL_Image.open(f).convert("RGB")
-        
     with open(THIS_DIR / "resources/clutter.jpeg", "rb") as f:
         clutter = PIL_Image.open(f).convert("RGB")
 

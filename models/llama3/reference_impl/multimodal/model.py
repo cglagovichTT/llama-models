@@ -28,7 +28,7 @@ from PIL import Image as PIL_Image
 from torch import nn, Tensor
 # from torch.distributed import _functional_collectives as funcol
 
-BFLOAT = True
+BFLOAT = False
 
 from ..model import apply_rotary_emb, ModelArgs, precompute_freqs_cis, RMSNorm
 
@@ -313,7 +313,7 @@ class ImageAttention(nn.Module):
             out = F.linear(attn_output, self.wo.weight)
             # out = reduce_from_tensor_model_parallel_region(out)
             out = out / self.qkvo_replication
-            return o
+            return out
 
 
 class ImageTransformerBlock(nn.Module):
@@ -351,7 +351,12 @@ class ImageTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor = None,
+        noise=False
     ):
+        # x = x + torch.randn_like(x) * .01 * x.std()
+        if noise:
+            x = x + torch.randn_like(x) * .01 * x.std()
+            print(f'std: {x.std()}')
         if BFLOAT:
             _gate_attn = 1 if not self.gated else self.gate_attn.tanh().bfloat16().float()
             _gate_ffn = 1 if not self.gated else self.gate_ffn.tanh().bfloat16().float()
@@ -392,7 +397,7 @@ class ImageTransformer(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor, return_intermediate=None, mask=None):
+    def forward(self, x: torch.Tensor, return_intermediate=None, mask=None, noise=False):
         print(f'ImageTransformer return_intermediates={return_intermediate}')
         print(f'x.shape={x.shape}')
         print(f'mask.shape={mask.shape}')
@@ -400,7 +405,7 @@ class ImageTransformer(nn.Module):
         for idx, r in enumerate(self.resblocks):
             if return_intermediate is not None and idx in return_intermediate:
                 out.append(x)
-            x = r(x, mask=mask)
+            x = r(x, mask=mask, noise=noise)
         if return_intermediate is not None:
             return x, torch.stack(out, dim=-1)
         return x
@@ -585,7 +590,7 @@ class VisionEncoder(nn.Module):
         if not SKIP_EMBED:
             x = self.apply_class_embedding(x)
             ntok += 1
-
+    
         # apply position embeddings
         x = x.reshape(bsz * num_concurrent_media, num_chunks, ntok, dim)
         if not SKIP_EMBED:
@@ -596,14 +601,10 @@ class VisionEncoder(nn.Module):
         x, npad = expand_num_tokens_to_mult8(x)
         attn_mask = build_encoder_attention_mask(x, ar, ntok, num_chunks, 1)
         x = x.view(bsz * num_concurrent_media, -1, dim)
+        
         x, int_x = self.transformer(
             x, return_intermediate=self.return_intermediate, mask=attn_mask
         )
-        
-        # # DEBUG!
-        # x = x.reshape(bsz * num_concurrent_media, num_chunks, ntok+npad, dim)
-        # x = contract_num_tokens_from_mult8(x, npad)
-        # return x
 
         x = self.ln_post(x)
         x = x.reshape(bsz * num_concurrent_media, num_chunks, ntok + npad, dim)
@@ -1060,12 +1061,17 @@ class CrossAttention(torch.nn.Module):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)    
         xq = self.q_norm(xq)
         xq = xq.transpose(1, 2)
+        # if seqlen == 1:
+            # return xq
 
         xk, xv = xattn_cache
         
         output = F.scaled_dot_product_attention(
             xq, xk, xv, attn_mask=xattn_mask, dropout_p=0.0
+            # xq, xk, xv, attn_mask=None, dropout_p=0.0
         )
+        # if seqlen == 1:
+            # return output
         output = output * full_text_row_masked_out_mask
         output = output.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1)
 
@@ -1199,9 +1205,13 @@ class CrossAttentionTransformerVision(torch.nn.Module):
         # vision_tokens: (B, T, D)
         # aspect_ratios: (B, T)
         # h: (B, T, D)
+        # torch.save(images, 'ocr_vision_input_images.pt')
+        # torch.save(aspect_ratios, 'ocr_vision_input_aspect_ratios.pt')
         vision_tokens = self.vision_encoder(
             images.to(dtype=torch.float32), aspect_ratios
         )
+        # vision_tokens = torch.load("/home/cglagovich/llama-models/vision_encoder_out.pt").float()
+        # vision_tokens = torch.load("/home/cglagovich/llama-models/ocr_vision_output_tt.pt").float()
 
         vision_tokens = F.linear(
             vision_tokens, self.vision_projection.weight, self.vision_projection.bias
@@ -1450,7 +1460,6 @@ class CrossAttentionTransformer(torch.nn.Module):
         assert len(batch_images) == len(
             batch_masks
         ), "Images and masks must have the same length"
-
         max_num_images = max(len(x) for x in batch_images)
         bsz = len(batch_images)
 
